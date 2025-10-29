@@ -427,6 +427,51 @@ pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 
+def _consolidate_forward_kwargs_to_gpu(forward_kwargs_cpu_list, device):
+    """
+    Consolidate CPU tensors from list of dicts and move to GPU.
+
+    For trajectory mode with vision models - consolidates per-turn forward_kwargs
+    (stored on CPU) into batched tensors on GPU for efficient forward pass.
+
+    Args:
+        forward_kwargs_cpu_list: List of dicts, each containing CPU tensors
+        device: Target GPU device
+
+    Returns:
+        Single dict with concatenated GPU tensors
+    """
+    if not forward_kwargs_cpu_list or not any(forward_kwargs_cpu_list):
+        return {}
+
+    # Find all keys
+    all_keys = set()
+    for kwargs in forward_kwargs_cpu_list:
+        all_keys.update(kwargs.keys())
+
+    result = {}
+
+    for key in all_keys:
+        values = [kwargs[key] for kwargs in forward_kwargs_cpu_list if key in kwargs and kwargs[key] is not None]
+
+        if not values:
+            continue
+
+        if isinstance(values[0], torch.Tensor):
+            # Concatenate and move to GPU
+            try:
+                result[key] = torch.cat(values, dim=0).to(device)
+            except RuntimeError:
+                # Shape mismatch - keep as list
+                result[key] = [v.to(device) for v in values]
+        elif key == "num_images":
+            result[key] = values  # Keep as list
+        else:
+            result[key] = values[0] if len(set(map(str, values))) == 1 else values
+
+    return result
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -435,7 +480,7 @@ def grpo_accumulated_loss(
     completion_mask,
     advantages,
     old_hidden_states,
-    ref_hidden_states, 
+    ref_hidden_states,
     n_chunks = -1,
     **kwargs,
 ):
@@ -446,6 +491,7 @@ def grpo_accumulated_loss(
     image_grid_thw = kwargs.get('image_grid_thw',None)
     pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
     image_sizes = kwargs.get('image_sizes',None)
+    forward_kwargs_cpu = kwargs.get('forward_kwargs_cpu', None)  # NEW: CPU tensors for batching
     # Find closest multiple
     factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
     if n_chunks == -1: n_chunks = bsz
@@ -487,8 +533,70 @@ def grpo_accumulated_loss(
         autocaster = nullcontext()
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
+
+    # TRAJECTORY MODE: Check if we need batched forward passes with CPU→GPU transfer
+    use_batched_forward = forward_kwargs_cpu is not None and len(forward_kwargs_cpu) > 0
+
+    # Get forward batch size from trainer config (default 64)
+    forward_batch_size = getattr(trainer.args, 'trajectory_forward_batch_size', 64) if use_batched_forward else bsz
+
+    # Ensure input_ids and attention_mask are on CPU if batching
+    if use_batched_forward:
+        if input_ids.is_cuda:
+            input_ids = input_ids.cpu()
+        if attention_mask.is_cuda:
+            attention_mask = attention_mask.cpu()
+
     with autocaster:
-        if pixel_values is None:
+        if use_batched_forward:
+            # BATCHED FORWARD PASSES: Process in chunks to avoid VRAM accumulation
+            all_hidden_states = []
+            device = trainer.model.device
+
+            for start_idx in range(0, bsz, forward_batch_size):
+                end_idx = min(start_idx + forward_batch_size, bsz)
+
+                # Slice batch from CPU
+                batch_input_ids = input_ids[start_idx:end_idx]
+                batch_attention_mask = attention_mask[start_idx:end_idx]
+
+                # Get forward_kwargs for this batch and consolidate to GPU
+                batch_forward_kwargs_cpu = forward_kwargs_cpu[start_idx:end_idx]
+                batch_forward_kwargs_gpu = _consolidate_forward_kwargs_to_gpu(
+                    batch_forward_kwargs_cpu,
+                    device
+                )
+
+                # Move text tensors to GPU
+                batch_input_ids = batch_input_ids.to(device)
+                batch_attention_mask = batch_attention_mask.to(device)
+
+                # Forward pass for this batch
+                batch_hidden_states = unwrapped_model(
+                    input_ids=batch_input_ids,
+                    attention_mask=batch_attention_mask,
+                    pixel_values=batch_forward_kwargs_gpu.get('pixel_values'),
+                    image_grid_thw=batch_forward_kwargs_gpu.get('image_grid_thw'),
+                    pixel_attention_mask=batch_forward_kwargs_gpu.get('pixel_attention_mask'),
+                    image_sizes=batch_forward_kwargs_gpu.get('image_sizes'),
+                    logits_to_keep=logits_to_keep + 1,
+                ).logits
+
+                # Keep hidden states on GPU, but free input tensors
+                all_hidden_states.append(batch_hidden_states)
+
+                # Free GPU memory for inputs
+                del batch_input_ids, batch_attention_mask, batch_forward_kwargs_gpu
+                torch.cuda.empty_cache()
+
+            # Concatenate all hidden states
+            new_hidden_states = torch.cat(all_hidden_states, dim=0)
+            del all_hidden_states
+
+            # Process for completion_input_ids (same as vision path)
+            completion_input_ids = input_ids[:, -logits_to_keep:].to(device)
+
+        elif pixel_values is None:
             new_hidden_states = unwrapped_model(
                 input_ids = input_ids,
                 attention_mask = attention_mask,
